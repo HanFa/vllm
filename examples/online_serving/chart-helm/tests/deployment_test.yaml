@@ -133,3 +133,20 @@ tests:
       - equal:
           path: spec.template.spec.initContainers[1].ports[0].containerPort
           value: 8080
+
+  - it: should create deployment with correct basic metadata
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Deployment
+      - isAPIVersion:
+          of: apps/v1
+      - matchRegex:
+          path: metadata.name
+          pattern: ^.*-deployment-vllm$
+      - isNotEmpty:
+          path: spec.template.spec.containers
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: vllm
