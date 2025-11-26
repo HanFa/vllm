@@ -48,7 +48,6 @@ from openai.types.responses.response_output_text import Logprob, LogprobTopLogpr
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
-from openai.types.responses.tool import Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
 
 from vllm import envs
@@ -94,7 +93,11 @@ from vllm.entrypoints.openai.protocol import (
 )
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
-from vllm.entrypoints.responses_utils import construct_chat_message_with_tool_call
+from vllm.entrypoints.responses_utils import (
+    construct_input_messages,
+    convert_tool_responses_to_completions_format,
+    extract_tool_types,
+)
 from vllm.entrypoints.tool_server import ToolServer
 from vllm.inputs.data import TokensPrompt as EngineTokensPrompt
 from vllm.logger import init_logger
@@ -106,23 +109,6 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
-
-
-def extract_tool_types(tools: list[Tool]) -> set[str]:
-    """
-    Extracts the tool types from the given tools.
-    """
-    tool_types: set[str] = set()
-    for tool in tools:
-        if tool.type == "mcp":
-            # Allow the MCP Tool type to enable built in tools if the
-            # server_label is allowlisted in
-            # envs.VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS
-            if tool.server_label in envs.VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS:
-                tool_types.add(tool.server_label)
-        else:
-            tool_types.add(tool.type)
-    return tool_types
 
 
 class OpenAIServingResponses(OpenAIServing):
@@ -513,9 +499,17 @@ class OpenAIServingResponses(OpenAIServing):
         ):
             tool_dicts = None
         else:
-            tool_dicts = [tool.model_dump() for tool in request.tools]
+            tool_dicts = [
+                convert_tool_responses_to_completions_format(tool.model_dump())
+                for tool in request.tools
+            ]
         # Construct the input messages.
-        messages = self._construct_input_messages(request, prev_response)
+        messages = construct_input_messages(
+            request_instructions=request.instructions,
+            request_input=request.input,
+            prev_msg=self.msg_store.get(prev_response.id) if prev_response else None,
+            prev_response_output=prev_response.output if prev_response else None,
+        )
         _, request_prompts, engine_prompts = await self._preprocess_chat(
             request,
             tokenizer,
@@ -778,11 +772,11 @@ class OpenAIServingResponses(OpenAIServing):
                 logger.exception("Error in reasoning parser creation.")
                 raise e
 
-            reasoning_content, content = reasoning_parser.extract_reasoning_content(
+            reasoning, content = reasoning_parser.extract_reasoning(
                 final_output.text, request=request
             )
         else:
-            reasoning_content = None
+            reasoning = None
             content = final_output.text
 
         # Log complete response if output logging is enabled
@@ -790,8 +784,8 @@ class OpenAIServingResponses(OpenAIServing):
             output_text = ""
             if content:
                 output_text = content
-            elif reasoning_content:
-                output_text = f"[reasoning: {reasoning_content}]"
+            elif reasoning:
+                output_text = f"[reasoning: {reasoning}]"
 
             if output_text:
                 self.request_logger.log_outputs(
@@ -805,15 +799,13 @@ class OpenAIServingResponses(OpenAIServing):
 
         reasoning_item = None
         message_item = None
-        if reasoning_content:
+        if reasoning:
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
                 summary=[],
                 type="reasoning",
                 content=[
-                    ResponseReasoningTextContent(
-                        text=reasoning_content, type="reasoning_text"
-                    )
+                    ResponseReasoningTextContent(text=reasoning, type="reasoning_text")
                 ],
                 status=None,  # NOTE: Only the last output item has status.
             )
@@ -881,47 +873,6 @@ class OpenAIServingResponses(OpenAIServing):
         if last_items:
             output_items.extend(last_items)
         return output_items
-
-    def _construct_input_messages(
-        self,
-        request: ResponsesRequest,
-        prev_response: ResponsesResponse | None = None,
-    ) -> list[ChatCompletionMessageParam]:
-        messages: list[ChatCompletionMessageParam] = []
-        if request.instructions:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": request.instructions,
-                }
-            )
-
-        # Prepend the conversation history.
-        if prev_response is not None:
-            # Add the previous messages.
-            prev_msg = self.msg_store[prev_response.id]
-            messages.extend(prev_msg)
-
-            # Add the previous output.
-            for output_item in prev_response.output:
-                # NOTE: We skip the reasoning output.
-                if isinstance(output_item, ResponseOutputMessage):
-                    for content in output_item.content:
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": content.text,
-                            }
-                        )
-
-        # Append the new input.
-        # Responses API supports simple text inputs without chat format.
-        if isinstance(request.input, str):
-            messages.append({"role": "user", "content": request.input})
-        else:
-            for item in request.input:
-                messages.append(construct_chat_message_with_tool_call(item))
-        return messages
 
     def _construct_harmony_system_input_message(
         self, request: ResponsesRequest, with_custom_tools: bool, tool_types: set[str]
@@ -1208,15 +1159,13 @@ class OpenAIServingResponses(OpenAIServing):
             if ctx.last_output.outputs:
                 output = ctx.last_output.outputs[0]
                 if reasoning_parser:
-                    delta_message = (
-                        reasoning_parser.extract_reasoning_content_streaming(
-                            previous_text=previous_text,
-                            current_text=previous_text + output.text,
-                            delta_text=output.text,
-                            previous_token_ids=previous_token_ids,
-                            current_token_ids=previous_token_ids + output.token_ids,
-                            delta_token_ids=output.token_ids,
-                        )
+                    delta_message = reasoning_parser.extract_reasoning_streaming(
+                        previous_text=previous_text,
+                        current_text=previous_text + output.text,
+                        delta_text=output.text,
+                        previous_token_ids=previous_token_ids,
+                        current_token_ids=previous_token_ids + output.token_ids,
+                        delta_token_ids=output.token_ids,
                     )
                 else:
                     delta_message = DeltaMessage(
@@ -1228,7 +1177,7 @@ class OpenAIServingResponses(OpenAIServing):
                     continue
                 if not first_delta_sent:
                     current_item_id = str(uuid.uuid4())
-                    if delta_message.reasoning_content:
+                    if delta_message.reasoning:
                         yield _increment_sequence_number_and_return(
                             ResponseOutputItemAddedEvent(
                                 type="response.output_item.added",
@@ -1280,15 +1229,15 @@ class OpenAIServingResponses(OpenAIServing):
                 # same as content or reasoning content
                 if (
                     previous_delta_messages
-                    and previous_delta_messages[-1].reasoning_content is not None
+                    and previous_delta_messages[-1].reasoning is not None
                     and delta_message.content is not None
                 ):
                     # from reasoning to normal content, send done
                     # event for reasoning
                     reason_content = "".join(
-                        pm.reasoning_content
+                        pm.reasoning
                         for pm in previous_delta_messages
-                        if pm.reasoning_content is not None
+                        if pm.reasoning is not None
                     )
                     yield _increment_sequence_number_and_return(
                         ResponseReasoningTextDoneEvent(
@@ -1356,7 +1305,7 @@ class OpenAIServingResponses(OpenAIServing):
                     # reset previous delta messages
                     previous_delta_messages = []
 
-                if delta_message.reasoning_content is not None:
+                if delta_message.reasoning is not None:
                     yield _increment_sequence_number_and_return(
                         ResponseReasoningTextDeltaEvent(
                             type="response.reasoning_text.delta",
@@ -1364,7 +1313,7 @@ class OpenAIServingResponses(OpenAIServing):
                             content_index=current_content_index,
                             output_index=current_output_index,
                             item_id=current_item_id,
-                            delta=delta_message.reasoning_content,
+                            delta=delta_message.reasoning,
                         )
                     )
                 elif delta_message.content is not None:
@@ -1392,11 +1341,11 @@ class OpenAIServingResponses(OpenAIServing):
 
                 previous_delta_messages.append(delta_message)
         if previous_delta_messages:
-            if previous_delta_messages[-1].reasoning_content is not None:
+            if previous_delta_messages[-1].reasoning is not None:
                 reason_content = "".join(
-                    pm.reasoning_content
+                    pm.reasoning
                     for pm in previous_delta_messages
-                    if pm.reasoning_content is not None
+                    if pm.reasoning is not None
                 )
                 yield _increment_sequence_number_and_return(
                     ResponseReasoningTextDoneEvent(
