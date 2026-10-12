@@ -1,0 +1,3 @@
+{"id":"math-smoke","prompt":"Solve 3x + 7 = 28. Explain each step and check the answer."}
+{"id":"code-smoke","prompt":"Write a Python function that merges two sorted lists without modifying either input. Include two examples."}
+{"id":"chat-smoke","prompt":"Explain to a beginner why the sky looks blue during the day and red near sunset."}

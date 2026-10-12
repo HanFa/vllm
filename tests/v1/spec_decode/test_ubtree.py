@@ -9,12 +9,13 @@ masking, and KV-selection errors without a model checkpoint or GPU engine.
 
 import itertools
 import math
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.spec_decode.ubtree import (
+from benchmarks.spec_decode.ubtree_reference import (
     UBTree,
     build_ubtree,
     follow_target_samples,
@@ -242,3 +243,245 @@ def test_duplicate_candidates_cannot_create_ambiguous_children():
             node_budget=2,
             search_width=2,
         )
+
+
+@pytest.fixture(params=["eager", "sdpa"])
+def tiny_qwen_target(request):
+    """Actual dense decoder/RoPE/cache; no checkpoint download is needed."""
+    transformers = pytest.importorskip("transformers")
+    if transformers.__version__ != "4.57.3":
+        pytest.skip("the standalone DFlash reference pins Transformers 4.57.3")
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    with torch.random.fork_rng():
+        torch.manual_seed(13)
+        config = transformers.Qwen3Config(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=256,
+        )
+        config._attn_implementation = request.param
+        model = transformers.Qwen3ForCausalLM(config).eval()
+    yield model
+    torch.set_num_threads(previous_threads)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("path", [(), (2, 5), (3, 4)])
+def test_qwen_tree_logits_and_compacted_kv_match_fresh_causal_decode(
+    tiny_qwen_target, path
+):
+    """Real decoder catches sibling leakage, flattened RoPE, and stale branch KV."""
+    from transformers import DynamicCache
+
+    from benchmarks.spec_decode.hf_tree import (
+        check_tree_logits,
+        commit_cache,
+        verify_tree,
+    )
+
+    model = tiny_qwen_target
+    prefix = torch.tensor([[11, 12, 13]])
+    cache = DynamicCache()
+    model(prefix, past_key_values=cache, use_cache=True)
+    tree = _branched_tree()
+    output = verify_tree(model, cache, tree)
+    check_tree_logits(model, prefix, tree, output.logits[0], atol=1e-6, rtol=1e-5)
+    paths = _paths(tree)
+    rows = torch.tensor([0, *[paths.index(path[:i]) for i in range(1, len(path) + 1)]])
+    commit_cache(cache, prefix.shape[1], rows)
+    committed = torch.cat([prefix, tree.token_ids[rows][None]], dim=1)
+    expected_cache = DynamicCache()
+    model(committed, past_key_values=expected_cache, use_cache=True)
+    assert cache.get_seq_length() == committed.shape[1]
+    for actual, expected in zip(cache.layers, expected_cache.layers):
+        torch.testing.assert_close(actual.keys, expected.keys, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(actual.values, expected.values, atol=1e-6, rtol=1e-5)
+
+    # Decode a second branched round after compaction, then a fresh bonus token.
+    second = verify_tree(model, cache, tree)
+    check_tree_logits(model, committed, tree, second.logits[0], atol=1e-6, rtol=1e-5)
+    commit_cache(cache, committed.shape[1], rows)
+    bonus = torch.tensor([[19]])
+    actual = model(bonus, past_key_values=cache, use_cache=True).logits[0, -1]
+    full = torch.cat([committed, tree.token_ids[rows][None], bonus], 1)
+    expected = model(full, use_cache=False).logits[0, -1]
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_sampled_tree_path_consumes_only_causal_path_randomness(tiny_qwen_target):
+    """Extra branches must not change RNG draws or the target sampling law."""
+    from benchmarks.spec_decode.hf_tree import sample_path
+
+    tree = _branched_tree()
+    probabilities = torch.zeros(3, 32)
+    probabilities[0, [2, 3]] = torch.tensor([0.3, 0.7])
+    probabilities[1, [4, 5]] = torch.tensor([0.6, 0.4])
+    probabilities[2, [8, 9]] = torch.tensor([0.2, 0.8])
+    for seed in range(16):
+        generator = torch.Generator().manual_seed(seed)
+        reference_generator = torch.Generator().manual_seed(seed)
+        result = sample_path(
+            tree,
+            probabilities[tree.depths].log(),
+            temperature=1.0,
+            generator=generator,
+            limit=8,
+            eos=(),
+        )
+        expected = [
+            int(torch.multinomial(p, 1, generator=reference_generator))
+            for p in probabilities
+        ]
+        assert result.output_token_ids.tolist() == expected
+        assert result.has_bonus_token
+        assert tree.token_ids[result.kv_row_indices].tolist() == [1, *expected[:-1]]
+        assert torch.equal(generator.get_state(), reference_generator.get_state())
+
+
+@torch.inference_mode()
+def test_probability_guard_catches_errors_hidden_by_wide_logit_tolerance(
+    tiny_qwen_target,
+):
+    """A BF16 logit allowance must not silently allow a large sampling change."""
+    from transformers import DynamicCache
+
+    from benchmarks.spec_decode.hf_tree import check_tree_logits, verify_tree
+
+    model = tiny_qwen_target
+    prefix = torch.tensor([[11, 12, 13]])
+    cache = DynamicCache()
+    model(prefix, past_key_values=cache, use_cache=True)
+    tree = _branched_tree()
+    logits = verify_tree(model, cache, tree).logits[0].clone()
+    logits[:, :16] += 0.7
+    with pytest.raises(AssertionError, match="probability TV"):
+        check_tree_logits(model, prefix, tree, logits, atol=1.0, rtol=0.0, max_tv=0.05)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_reference_target_decode_matches_independent_causal_sampling(
+    tiny_qwen_target, temperature
+):
+    """Check first-token/output-limit accounting and cached target sampling."""
+    from benchmarks.spec_decode.hf_tree import generate, sample_token
+
+    model = tiny_qwen_target
+    prompt = torch.tensor([[11, 12, 13]])
+    result = generate(
+        model,
+        None,
+        prompt,
+        arm="target",
+        max_new_tokens=8,
+        temperature=temperature,
+        seed=71,
+    )
+    full = prompt.clone()
+    generator = torch.Generator().manual_seed(71)
+    for _ in range(8):
+        logits = model(full, use_cache=False).logits[0, -1]
+        token = sample_token(logits, temperature, generator)
+        full = torch.cat([full, torch.tensor([[token]])], 1)
+    assert result["output_token_ids"] == full[0, prompt.shape[1] :].tolist()
+    assert result["decode_tokens"] == result["rounds"] == 7
+    assert result["decode_tpot_ms"] == result["decode_ms"] / 7
+
+
+@pytest.mark.skipif(
+    os.environ.get("VLLM_TEST_DFLASH_REFERENCE") != "1",
+    reason="opt-in test downloads pinned DFlash Python code, never model weights",
+)
+@torch.inference_mode()
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_public_dflash_code_cache_and_generation_parity(tiny_qwen_target, temperature):
+    """Exercise the real checkpoint interface with tiny random weights on CPU."""
+    from transformers import DynamicCache, Qwen3Config
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    from benchmarks.spec_decode.dflash_tree import DRAFT, DRAFT_REVISION
+    from benchmarks.spec_decode.hf_tree import generate
+
+    draft_class = get_class_from_dynamic_module(
+        "dflash.DFlashDraftModel", DRAFT, revision=DRAFT_REVISION
+    )
+
+    # Hugging Face resolves the pinned checkpoint class at runtime.
+    class CheckedDraft(draft_class):  # type: ignore[valid-type, misc]
+        def forward(self, **kwargs):
+            if kwargs["past_key_values"].get_seq_length() == 0:
+                self.history = kwargs["target_hidden"]
+            else:
+                self.history = torch.cat([self.history, kwargs["target_hidden"]], 1)
+            actual = super().forward(**kwargs)
+            full = dict(kwargs)
+            full["past_key_values"] = DynamicCache()
+            full["target_hidden"] = self.history
+            full["position_ids"] = torch.arange(
+                self.history.shape[1] + self.block_size
+            )[None]
+            expected = super().forward(**full)
+            torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+            return actual
+
+    config = Qwen3Config(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_target_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=256,
+        block_size=4,
+        dflash_config={"mask_token_id": 31, "target_layer_ids": [0]},
+    )
+    config._attn_implementation = tiny_qwen_target.config._attn_implementation
+    with torch.random.fork_rng():
+        torch.manual_seed(51)
+        draft = CheckedDraft(config).eval()
+    for limit in (1, 2, 12):
+        baseline = None
+        for arm, budget in [("target", 0), ("chain", 0), ("tree", 0), ("tree", 8)]:
+            result = generate(
+                tiny_qwen_target,
+                draft,
+                torch.tensor([[11, 12, 13]]),
+                arm=arm,
+                max_new_tokens=limit,
+                temperature=temperature,
+                seed=7,
+                budget=budget,
+                width=8,
+                top_k=16,
+                depth=3,
+                check_rounds=1,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+            if baseline is None:
+                baseline = result["output_token_ids"]
+            assert result["output_token_ids"] == baseline
+    assert baseline is not None
+    for arm in ("target", "chain", "tree"):
+        result = generate(
+            tiny_qwen_target,
+            draft,
+            torch.tensor([[11, 12, 13]]),
+            arm=arm,
+            max_new_tokens=12,
+            temperature=temperature,
+            seed=7,
+            depth=3,
+            top_k=16,
+            eos=(baseline[0],),
+        )
+        assert result["output_token_ids"] == baseline[:1]
+        assert result["rounds"] == 0

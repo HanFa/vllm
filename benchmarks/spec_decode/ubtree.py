@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 
-from vllm.v1.spec_decode.ubtree import build_ubtree, score_ubtree_edges
+from benchmarks.spec_decode.ubtree_reference import build_ubtree, score_ubtree_edges
 
 
 def synthetic_inputs(seed: int) -> dict:
